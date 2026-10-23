@@ -1,75 +1,70 @@
-# Аватар: завантаження, перевірка й збереження
+# Avatar storage
 
-Ця версія додає `POST /api/avatar/upload`, `POST /api/avatar/complete` і `GET /api/avatar`. Бекенд перевіряє справжній вміст завантаженого зображення, створює окремий JPEG, зберігає його ключ у PostgreSQL і видає тимчасове посилання для читання. Код підготовлено й протестовано локально, потім перенесено на VPS після приватних резервних копій коду та БД. На VPS також пройшли 64 тести й міграція. Справжній цикл S3/БД перевірено на тимчасовому акаунті, який разом із його файлами видалено. HTTPS на IP уже налаштовано та перевірено, автоматичне поновлення перевірено через dry-run. Користувач підтвердив завантаження й збереження аватара на телефоні після повторного входу.
+[Українська](#українська)
 
-## Як працює
+## Upload contract
 
-1. Телефон надсилає JWT і JSON `{ "contentType": "image/jpeg", "fileSize": 1234 }`.
-2. `authMiddleware` перевіряє JWT, а маршрут перевіряє наявність користувача в PostgreSQL.
-3. Дозволені JPEG і PNG, ціле число байтів від 1 до 5 242 880 включно. SVG та HEIC поки не підтримуються. Невідомі поля, зокрема `userId` та `key`, відхиляються.
-4. Сервер сам створює ключ `avatars/pending/<ID з JWT>/<UUID>.jpg` або `.png`. Цей маршрут не дозволяє перезаписати довільний ключ іншого користувача.
-5. AWS SDK підписує POST-форму на 300 секунд. В її політиці зафіксовані bucket, повний ключ, `Content-Type` і `content-length-range` від 1 до 5 МіБ. Саме S3 має перевіряти цю політику під час фактичного завантаження.
+All endpoints require `Authorization: Bearer <JWT>` over HTTPS.
 
-Відповідь `200`: `{ "upload": { "url": "...", "fields": { "...": "..." }, "key": "...", "expiresIn": 300, "maxFileSize": 5242880 } }`.
+1. Send `POST /api/avatar/upload` with `{"contentType":"image/jpeg","fileSize":1234}`. Accepted types are `image/jpeg` and `image/png`; size must be an integer from 1 to 5,242,880 bytes.
+2. The response contains `upload.url`, `fields`, `key`, `expiresIn`, and `maxFileSize`. The signed form is valid for 300 seconds and permits only the exact pending key, MIME type, and byte range.
+3. POST multipart form data to `upload.url`. Include every returned field unchanged and append the image as the final `file` field. Do not forward the application's JWT to S3 or set the multipart boundary manually.
+4. After S3 accepts the upload, send `POST /api/avatar/complete` with `{"key":"avatars/pending/<userId>/<UUID>.jpg"}`. The server verifies ownership and content before updating the account.
+5. Read the saved avatar with `GET /api/avatar`. The response is `{"avatar":null}` or `{"avatar":{"url":"...","expiresAt":"..."}}`. Completion returns the same avatar object. Read URLs expire after 15 minutes.
 
-Клієнт створює `FormData`, додає кожне поле з `upload.fields` без змін, а останнім — `file`, і надсилає POST на `upload.url`. Заголовок multipart із boundary формує HTTP-клієнт. JWT застосунку надсилається лише бекенду, до S3 його не додаємо. Мобільний код цього циклу реалізовано в проєкті застосунку.
+`fileSize` is an early check of the client's claim. S3 separately enforces the actual byte limit. MIME type alone does not establish that a file is a valid image.
 
-`fileSize` у JSON — попередня перевірка заявленого розміру. Підписана політика окремо обмежує фактичний розмір файла. MIME у формі ще не доводить, що вміст є справжнім зображенням: це перевіряється декодуванням під час `/complete`.
+## Validation and persistence
 
-## Файли
+The server reads at most 5 MiB, verifies JPEG/PNG signatures, and decodes the image with `sharp`. Maximum dimensions are 4096 × 4096; multi-frame input is rejected. The result is a JPEG of at most 512 × 512 pixels without source EXIF/GPS metadata.
 
-- `avatarRoutes.js`: перевірка запиту, користувача та ліміт 5 звернень на хвилину на ID з JWT.
-- `avatarStorage.js`: створення ключа та підписаної форми через офіційний AWS SDK.
-- `server.js`: підключення маршруту перед загальним JSON-парсером; власний парсер маршруту обмежений 2 КіБ та працює після перевірки JWT.
-- `tests/avatar.test.js`: локальні HTTP-тести з підставною БД і справжнім підписанням SDK на вигаданих ключах. Немає звернень до S3 чи справжнього профілю AWS.
-- `tests/auth.test.js`: попередні перевірки сесії та перевірки підключення маршруту.
-- `.env.avatar.example`: лише назви профілю, регіону та bucket, без секретів. Це доповнення до наявного `.env`, а не його заміна.
+Verified images receive a new key under `avatars/verified/<userId>/`. The upload form cannot overwrite this object. Only the verified key and the last confirmed pending key are stored in PostgreSQL; signed URLs are generated on demand.
 
-## Локальне відтворення
+Completion locks the user's row within a transaction. Updating the avatar and enqueueing obsolete objects happen in the same commit. Retrying the last confirmed upload returns the saved avatar. A durable cleanup entry is created before writing a new verified object, so failed finalization can be recovered after a process restart.
 
-Потрібен Node.js 24 або новіший. У папці локальної копії бекенду:
+## Migration and cleanup
 
-```bash
-npm ci
-npm test
-```
+Back up PostgreSQL before running `npm run migrate:avatar`. The repeatable migration adds `users.avatar_key`, `users.avatar_upload_key`, and `avatar_cleanup_jobs` to the existing schema.
 
-Для тестів не потрібні `.env`, AWS CLI, справжні ключі чи PostgreSQL. Тестовий HTTP-сервер слухає лише `127.0.0.1` на випадковому порту й закривається після перевірок.
+The cleanup worker runs once per minute and processes up to 20 eligible jobs. It skips objects referenced by a current avatar and retries failed work. New verified objects remain eligible for failure recovery after a one-hour delay unless their transaction commits.
 
-## Налаштування VPS
+Uploads that never reach completion require an S3 Lifecycle rule. `s3-pending-lifecycle.json` expires objects under `avatars/pending/` after one day and aborts incomplete multipart uploads after one day. Apply it separately with an administrative identity; the application must not manage bucket lifecycle policies. Never scope this rule to `avatars/verified/`. Lifecycle deletion is asynchronous.
 
-Після окремого перенесення й перевірки патча потрібно буде додати три несекретні параметри з `.env.avatar.example` у наявний `.env` бекенду. Справжні AWS-ключі залишаються у `~/.aws/credentials`, профіль `workout-tracker`. Процес має працювати від власника цього профілю. Доступ до файлів уже налаштований користувачем: каталог `700`, файл `600`.
+## Responses
 
-Не копіювати `.env` чи `.aws` до мобільного проєкту. Перевіряти зміст змін перед Git-комітом. Підписана форма також дає тимчасовий доступ: її не слід публікувати або записувати в журнали.
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid input, image, or object key |
+| `401` | Missing/invalid session or deleted account |
+| `413` | JSON request exceeds the body limit |
+| `429` | Rate limit exceeded |
+| `500` | Database check failed |
+| `503` | Storage or finalization temporarily unavailable |
 
-Відповіді маршруту: `400` — некоректні параметри/JSON, `401` — нечинна сесія або видалений користувач, `413` — JSON понад 2 КіБ, `429` — перевищено ліміт, `500` — збій БД, `503` — відсутня конфігурація чи неможливо підписати форму. Відповіді мають `Cache-Control: no-store`.
+## Українська
 
-## Підтвердження та читання
+### Завантаження
 
-Після успішного POST у S3 телефон надсилає `POST /api/avatar/complete` із JWT та `{ "key": "avatars/pending/<власний ID>/<UUID>.jpg" }`. Сервер перевіряє належність шляху, обмежує читання S3 до 5 МіБ, перевіряє сигнатуру файла й декодує його через `sharp`. Дозволені JPEG/PNG до 4096 × 4096, без багатокадрових зображень. Новий JPEG має розмір до 512 × 512; EXIF/GPS не переносяться.
+Усі маршрути потребують JWT у заголовку `Authorization: Bearer <JWT>` та HTTPS.
 
-Перевірена копія отримує новий випадковий ключ `avatars/verified/<ID>/<UUID>.jpg`. Телефон не має дозволу записувати за цим ключем: початкова POST-форма дозволяє лише конкретний pending-ключ. Повторний запис у pending не змінює підтверджене фото.
+1. Надішліть `POST /api/avatar/upload` із `contentType` (`image/jpeg` або `image/png`) і цілим `fileSize` від 1 до 5 242 880 байтів.
+2. Отримайте підписану форму: `upload.url`, `fields`, `key`, `expiresIn`, `maxFileSize`. Вона діє 300 секунд і обмежує точний pending-ключ, MIME та фактичний розмір.
+3. Надішліть multipart POST до S3: усі отримані поля без змін, останнім — `file`. JWT застосунку до S3 не передається; boundary формує HTTP-клієнт.
+4. Підтвердьте завантаження через `POST /api/avatar/complete` із полем `key`. Сервер перевірить належність файла та вміст перед записом у БД.
+5. Отримайте поточний аватар через `GET /api/avatar`: `avatar: null` або об'єкт із `url` та `expiresAt`. Посилання діє 15 хвилин; підтвердження повертає такий самий об'єкт.
 
-У транзакції PostgreSQL блокується рядок користувача (`FOR UPDATE`), записуються `users.avatar_key` та `users.avatar_upload_key`, а попередні файли додаються в `avatar_cleanup_jobs`. Перше поле вказує на підтверджене фото; друге дозволяє розпізнати повторний запит після втрати відповіді. Постійні та тимчасові URL у базу не записуються. Перед записом у S3 майбутній ключ реєструється в черзі з відстрочкою на годину; успішна транзакція прибирає цей запис. Це дозволяє прибрати новий файл, якщо після його створення стався збій БД чи процесу.
+### Перевірка та збереження
 
-`GET /api/avatar` із JWT повертає `{ "avatar": null }` або `{ "avatar": { "url": "...", "expiresAt": "..." } }`. Приватне посилання діє 15 хвилин. `/complete` повертає такий самий об'єкт аватара після успішної транзакції.
+Сервер контролює фактичні байти (до 5 МіБ), сигнатуру JPEG/PNG та декодування через `sharp`. Допустимий розмір — до 4096 × 4096; багатокадрові зображення відхиляються. Результат повторно кодується в JPEG до 512 × 512 без EXIF/GPS.
 
-## Міграція й прибирання
+Перевірена копія отримує новий ключ `avatars/verified/<userId>/`. Початкова S3-форма не дозволяє його перезаписати. У PostgreSQL зберігаються ключ аватара та останній підтверджений pending-ключ; тимчасові URL створюються під час читання.
 
-Перед запуском нового сервера виконати з Node.js 24 у папці бекенду `npm ci`, `npm test`, а після резервної копії БД — `npm run migrate:avatar`. Скрипт читає наявний `.env` на VPS; значення секретів не виводяться. Міграція `migrations/002-avatar.sql` додає поля та таблицю черги, не видаляє користувачів і допускає повторний запуск. У робочій БД її потрібно виконати від користувача з правами зміни таблиць.
+Підтвердження блокує рядок користувача в транзакції. Новий ключ і завдання прибирання попередніх файлів фіксуються одним комітом. Повтор останнього підтвердження повертає збережений аватар. До запису нової копії створюється надійне завдання прибирання для відновлення після збою процесу чи транзакції.
 
-Працюючий сервер раз на хвилину обробляє до 20 доступних завдань прибирання. Він не видаляє ключ, який досі вказаний як поточний аватар. Невдала операція лишається в черзі для повтору; за потреби збільшення навантаження потрібні додаткові квоти та спостереження за довжиною черги.
+### Міграція та прибирання
 
-Для покинутих завантажень (коли `/complete` взагалі не викликано) налаштувати окреме S3 Lifecycle-правило лише для `avatars/pending/` з видаленням через 1 день. Приклад — `s3-pending-lifecycle.json`. Налаштовується адміністратором bucket; IAM-користувач застосунку не має прав змінювати Lifecycle. Це нова конфігурація, вона ще не застосована. Не встановлювати це правило на `avatars/verified/`.
+Перед `npm run migrate:avatar` зробіть резервну копію БД. Повторювана міграція додає `users.avatar_key`, `users.avatar_upload_key` та `avatar_cleanup_jobs` до наявної схеми.
 
-## Мобільний код і межі перевірки
+Раз на хвилину сервер обробляє до 20 доступних завдань. Файли поточних аватарів не видаляються; невдалі операції повторюються. Для нової перевіреної копії прибирання після збою відкладається на годину, а успішна транзакція скасовує це завдання.
 
-Мобільний застосунок використовує API Expo SDK 57: `ImageManipulator.manipulate` для центрального квадратного обрізання та JPEG до 512 × 512, `File` і `expo/fetch` для multipart-завантаження. Файл додається останнім, JWT до S3 не надсилається. Кеш підготовленого файла очищається. Старий аватар зберігається на екрані до підтвердження нового. Після входу, повернення на передній план або оновлення посилання аватар читається з бекенду; періодичне оновлення — раз на 12 хвилин.
-
-Мобільний клієнт відмовляється надсилати запити аватара через HTTP. HTTPS API вже налаштований; у новому середовищі налаштувати HTTPS і змінити лише локальний `src/config.ts` на захищену адресу з `/api` в кінці. Секретів у мобільному коді не потрібно. Додавання HTTPS лише для S3 не захищає звернення до власного бекенду.
-
-Після перевірки безпеки локально пройшли 72 тести бекенду на Node.js 24.22.1 і 45 тестів мобільного коду. SQL-міграція, транзакція, відкат і повтор перевірені на PostgreSQL у пам'яті через PGlite; перевірка зображень — справжнім sharp; S3-операції замінені сховищем у пам'яті. TypeScript і експорт JS для iOS/Android пройшли. Після цього перевірено справжні S3 і БД на VPS: реєстрація й вхід тимчасового акаунта, POST у S3, підтвердження, читання JPEG та повтор підтвердження. Тестовий акаунт і файли видалено. Повний живий цикл повторено через HTTPS. Користувач також підтвердив роботу на фізичному телефоні. ESLint у мобільному проєкті ще не налаштований.
-
-Підписана форма не одноразова: до завершення її строку її можна повторно використати для того самого ключа. Видавання нового дозволу створює новий ключ. Ліміт запитів зберігається в пам'яті одного процесу, скидається після перезапуску та не є загальною квотою сховища. Поки не завершено перевірку вмісту, `pending`-файл не повинен відображатися як підтверджений аватар.
-
-Джерела: [AWS SDK: presigned POST](https://github.com/aws/aws-sdk-js-v3/tree/main/packages/s3-presigned-post), [параметри express-rate-limit](https://express-rate-limit.mintlify.app/reference/configuration).
+Покинуті завантаження потребують окремого правила S3 Lifecycle. Приклад `s3-pending-lifecycle.json` задає видалення `avatars/pending/` і скасування незавершених multipart-завантажень через день. Правило застосовує адміністратор, не застосунок; його не можна поширювати на `avatars/verified/`. Видалення виконується асинхронно. Значення HTTP-статусів наведено в таблиці вище.
