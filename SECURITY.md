@@ -1,25 +1,53 @@
-# Безпека та межі перевірки
+# Security
 
-## Що перевірено перед публікацією
+[Українська](#українська)
 
-- Історія попередніх комітів та остаточні файли перевірені Gitleaks 8.30.1 із приховуванням значень у звітах. Перед відправленням окремо перевіряється точний Git-індекс.
-- Робочі залежності перевірені через `npm audit --omit=dev`: на момент перевірки 23 жовтня 2026 року відомих вразливостей не виявлено. Це не гарантія відсутності нових чи ще невідомих проблем.
-- 72 локальні тести перевіряють JWT, належність файлів, обмеження завантаження, декодування фото, транзакції, відкат, прибирання та захист входу. Це не повний тест на проникнення або аудит усієї інфраструктури.
+## Deployment requirements
 
-## Захист API
+- Terminate TLS at a trusted reverse proxy. Keep the Node listener private; only loopback proxies are trusted by default.
+- Store database credentials, `JWT_SECRET`, and AWS credentials outside version control. Use a random JWT secret of at least 32 bytes.
+- Keep the S3 bucket private with public access blocked and ACLs disabled. Restrict the application's IAM permissions to avatar objects.
+- Do not log authorization headers, passwords, signed upload forms, or signed download URLs. Rotate exposed credentials; removing a file from Git does not revoke them.
 
-JWT перевіряється за HS256, строком дії та числовим ID. SQL використовує параметри. Фото проходить обмежене читання, декодування і повторне кодування в JPEG без EXIF/GPS. Приватні ключі файлів створює сервер; URL для читання тимчасові.
+## Implemented controls
 
-Вхід обмежено 20 запитами за 15 хвилин на IP, реєстрацію — 5 за годину на IP. JSON обмежений 2 КіБ. Перевіряються типи полів; bcrypt-пароль обмежений 72 байтами UTF-8, щоб уникнути мовчазного обрізання. Для нових паролів мінімум 8 символів. Раніше зареєстровані паролі понад 72 байти потребуватимуть окремого безпечного відновлення доступу; тут немає міграції паролів.
+- HS256 JWT verification, expiry checks, and positive integer user IDs. SQL queries use bound parameters.
+- Login: 20 requests per IP per 15 minutes. Registration: 5 requests per IP per hour. Avatar upload and completion: separate limits of 5 requests per user per minute.
+- Authentication and avatar JSON bodies are limited to 2 KiB. Credential fields are type-checked; bcrypt passwords are limited to 72 UTF-8 bytes. New passwords require a minimum length of 8.
+- Uploaded images are limited to 5 MiB and 4096 × 4096 pixels, decoded, and re-encoded as JPEG without EXIF/GPS metadata. Verified objects use server-generated keys separate from pending uploads.
+- Responses use `Cache-Control: no-store`. Error responses omit stack traces and database or AWS details.
 
-Відповіді не містять стеку чи деталей БД/AWS, не кешуються. У журнали входу не записуються email, паролі, токени чи повні об'єкти помилок. Код за замовчуванням слухає loopback; HTTPS і правила мережі налаштовуються окремо.
+## Limitations
 
-## Залишкові обмеження
+- Rate limits are stored in process memory and reset on restart. Multiple instances require a shared limiter store. These limits do not provide distributed DDoS protection or storage quotas.
+- JWTs expire after 30 days. There is no token revocation list; signing-key rotation invalidates existing sessions.
+- S3 upload forms can be reused for their exact pending key until they expire after 5 minutes. Read URLs expire after 15 minutes. Treat both as temporary credentials.
+- Cleanup jobs handle replaced avatars and failed finalization. Abandoned uploads require a separate S3 Lifecycle rule scoped to `avatars/pending/`. The supplied rule is an example and is not applied by the application.
+- Existing passwords longer than bcrypt's 72-byte limit require a separate account recovery path. This change does not migrate password hashes.
 
-- Ліміти зберігаються в пам'яті одного процесу, скидаються при перезапуску й не захищають від розподіленого DDoS. Спільна IP-адреса має спільний ліміт. Для масштабування потрібні спільне сховище лімітів і захист на проксі.
-- Токен діє 30 днів; окремого списку відкликання немає. Зберігати його в захищеному сховищі клієнта, використовувати тільки HTTPS.
-- Підписана S3 POST-форма повторно придатна протягом 5 хвилин для того самого pending-ключа. Квоти сховища та глобальне обмеження паралельної обробки тут не реалізовані.
-- S3 Lifecycle для покинутих `avatars/pending/` відкладено. Приклад правила в репозиторії не застосовується автоматично; його не можна поширювати на `avatars/verified/`.
-- Приватні ключі AWS і налаштування БД залишаються поза Git. `.gitignore` не видаляє раніше оприлюднені секрети: у разі витоку ключ потрібно відкликати й замінити.
+Automated tests and dependency scans cover specific failure modes; they do not replace an infrastructure review or penetration test. Do not include credentials or personal data in public issue reports.
 
-Рекомендації звірено з [Express: production security](https://expressjs.com/en/advanced/best-practice-security/) та [Express: reverse proxies](https://expressjs.com/en/guide/behind-proxies/).
+## Українська
+
+### Вимоги до розгортання
+
+- Використовуйте HTTPS через довірений проксі. Node має бути недоступним напряму з Інтернету; за замовчуванням довіряє лише локальним проксі.
+- Зберігайте доступ до БД, `JWT_SECRET` і ключі AWS поза Git. Використовуйте випадковий секрет JWT довжиною щонайменше 32 байти.
+- Залишайте S3 bucket приватним із блокуванням публічного доступу та вимкненими ACL. Обмежуйте IAM-дозволи застосунку об'єктами аватарів.
+- Не записуйте в журнали паролі, заголовки авторизації, підписані форми чи URL. У разі витоку відкличте й замініть ключі: видалення файла з Git не робить їх недійсними.
+
+### Реалізовані обмеження
+
+JWT перевіряється за HS256, строком дії та додатним числовим ID. SQL використовує параметри. Вхід обмежено 20 запитами за 15 хвилин на IP, реєстрацію — 5 за годину на IP. Видача дозволу на аватар і підтвердження мають окремі ліміти: по 5 запитів за хвилину на користувача.
+
+JSON обмежений 2 КіБ; перевіряються типи полів і максимальна довжина пароля — 72 байти UTF-8. Мінімальна довжина нового пароля — 8. Зображення обмежене 5 МіБ та 4096 × 4096 пікселів і повторно кодується в JPEG без EXIF/GPS. Перевірені файли отримують окремі ключі, створені сервером. Відповіді не кешуються й не містять стеку або деталей БД/AWS.
+
+### Обмеження поточної реалізації
+
+Ліміти зберігаються в пам'яті процесу та скидаються після перезапуску. Для кількох процесів потрібне спільне сховище лімітів; захист від розподіленого DDoS і квоти сховища налаштовуються окремо.
+
+JWT діє 30 днів; списку відкликання токенів немає. Заміна ключа підпису робить наявні сесії недійсними. S3 POST-форма повторно придатна для свого pending-ключа протягом 5 хвилин; посилання для читання діє 15 хвилин. Обидва надають тимчасовий доступ.
+
+Черга прибирання обробляє замінені аватари та збої підтвердження. Для покинутих завантажень потрібне окреме S3 Lifecycle-правило лише на `avatars/pending/`; приклад у репозиторії не застосовується автоматично. Для старих паролів понад 72 байти потрібне окреме відновлення доступу; міграції хешів немає.
+
+Тести й перевірка залежностей охоплюють визначені сценарії, але не замінюють аудит інфраструктури. Не додавайте ключі чи особисті дані до публічних повідомлень про помилки.
