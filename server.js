@@ -7,6 +7,10 @@ const createAvatarRouter = require('./avatarRoutes');
 const { createAvatarStorage } = require('./avatarStorage');
 const startAvatarCleanup = require('./avatarCleanup');
 const createAuthRouter = require('./authRoutes');
+const createWorkoutRouter = require('./workoutRoutes');
+const createTemplateRouter = require('./templateRoutes');
+const createProfileRouter = require('./profileRoutes');
+const createWorkoutTemplateRouter = require('./workoutTemplateRoutes');
 
 if (!process.env.JWT_SECRET || !process.env.JWT_SECRET.trim()) {
   throw new Error('JWT_SECRET не налаштований. Перевірте конфігурацію сервера.');
@@ -27,6 +31,10 @@ app.use(cors());
 const avatarStorage = createAvatarStorage();
 app.use('/api/avatar', createAvatarRouter({ pool, storage: avatarStorage }));
 app.use('/api/auth', createAuthRouter({ pool }));
+app.use('/api/workouts', createWorkoutRouter({ pool }));
+app.use('/api/exercise-templates', createTemplateRouter({ pool }));
+app.use('/api/profile', createProfileRouter({ pool }));
+app.use('/api/workout-templates', createWorkoutTemplateRouter({ pool }));
 
 app.get('/', (req, res) => {
   res.send('Сервер Workout Tracker працює!');

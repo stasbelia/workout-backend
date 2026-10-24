@@ -9,7 +9,13 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test",
-    "migrate:avatar": "node scripts/migrate-avatar.js"
+    "migrate:avatar": "node scripts/migrate-avatar.js",
+    "migrate:workouts": "node scripts/migrate-workouts.js",
+    "migrate:exercises": "node scripts/migrate-exercises.js",
+    "migrate:templates": "node scripts/migrate-templates.js",
+    "migrate:profile": "node scripts/migrate-profile.js",
+    "migrate:completion": "node scripts/migrate-completion.js",
+    "migrate:editing": "node scripts/migrate-editing.js"
   },
   "keywords": [],
   "author": "",
